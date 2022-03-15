@@ -30,17 +30,17 @@
 #include <linux/skbuff.h>
 #include <linux/dma-mapping.h>
 #include <linux/workqueue.h>
-#include <linux/reset.h>
-#include <linux/of.h>
-#include <linux/mfd/syscon.h>
-#include <linux/regmap.h>
 
 #include <linux/bitops.h>
+#define BITM(_count)	(BIT(_count) - 1)
+#define BITS(_shift, _count)	(BITM(_count) << _shift)
 
 #include <asm/mach-ath79/ar71xx_regs.h>
 #include <asm/mach-ath79/ath79.h>
+#include <asm/mach-ath79/ag71xx_platform.h>
 
 #define AG71XX_DRV_NAME		"ag71xx"
+#define AG71XX_DRV_VERSION	"0.5.35"
 
 /*
  * For our NAPI weight bigger does *NOT* mean better - it means more
@@ -67,6 +67,8 @@
 
 #define AG71XX_TX_RING_SIZE_MAX		128
 #define AG71XX_RX_RING_SIZE_MAX		256
+
+#define QCA955X_SGMII_LINK_WAR_MAX_TRY	10
 
 #ifdef CONFIG_AG71XX_DEBUG
 #define DBG(fmt, args...)	pr_debug(fmt, ## args)
@@ -116,6 +118,15 @@ struct ag71xx_ring {
 	unsigned int		dirty;
 };
 
+struct ag71xx_mdio {
+	struct mii_bus		*mii_bus;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,5,0)
+	int			mii_irq[PHY_MAX_ADDR];
+#endif
+	void __iomem		*mdio_base;
+	struct ag71xx_mdio_platform_data *pdata;
+};
+
 struct ag71xx_int_stats {
 	unsigned long		rx_pr;
 	unsigned long		rx_be;
@@ -147,6 +158,13 @@ struct ag71xx_debug {
 };
 
 struct ag71xx {
+	int is_master; //must be a first var!
+	int has_slaves;
+	int sw_ver;
+	struct switch_dev *phy_swdev;
+	int slave_devs_count;
+	struct net_device **slave_devs;
+
 	/*
 	 * Critical data related to the per-packet data path are clustered
 	 * early in this structure to help improve the D-cache footprint.
@@ -154,12 +172,9 @@ struct ag71xx {
 	struct ag71xx_ring	rx_ring ____cacheline_aligned;
 	struct ag71xx_ring	tx_ring ____cacheline_aligned;
 
-	int			mac_idx;
-
-	u16			desc_pktlen_mask;
-	u16			rx_buf_size;
-	u8			rx_buf_offset;
-	u8			tx_hang_workaround:1;
+	unsigned int            max_frame_len;
+	unsigned int            desc_pktlen_mask;
+	unsigned int            rx_buf_size;
 
 	struct net_device	*dev;
 	struct platform_device  *pdev;
@@ -171,46 +186,65 @@ struct ag71xx {
 	 * From this point onwards we're not looking at per-packet fields.
 	 */
 	void __iomem		*mac_base;
-	void __iomem		*mii_base;
 
 	struct ag71xx_desc	*stop_desc;
 	dma_addr_t		stop_desc_dma;
 
+	struct mii_bus		*mii_bus;
 	struct phy_device	*phy_dev;
 	void			*phy_priv;
-	int			phy_if_mode;
 
 	unsigned int		link;
 	unsigned int		speed;
 	int			duplex;
 
 	struct delayed_work	restart_work;
+	struct delayed_work	link_work;
 	struct timer_list	oom_timer;
-
-	struct reset_control *mac_reset;
-	struct reset_control *mdio_reset;
-
-	u32			fifodata[3];
-	u32			plldata[3];
-	u32			pllreg[3];
-	struct regmap		*pllregmap;
 
 #ifdef CONFIG_AG71XX_DEBUG_FS
 	struct ag71xx_debug	debug;
 #endif
+#ifdef CONFIG_AG71XX_ATH_HDR_SUPPORT
+	int (*ag71xx_remove_atheros_header)(struct sk_buff *skb, int pktlen, int *port_num);
+#endif
 };
 
-struct ag71xx_mdio {
-	struct reset_control *mdio_reset;
-	struct mii_bus		*mii_bus;
-	struct regmap		*mii_regmap;
+struct ag71xx_slave {
+	int is_master; //must be a first var!
+	u32 port_num;
+	u8 ath_hdr_port_byte;
+	spinlock_t		lock;
+	struct net_device	*dev;
+	struct ag71xx *master_ag;
+	unsigned int link;
+	unsigned int speed;
+	int duplex;
+	bool aneg;
+	unsigned int adj_speed;
+	int adj_duplex;
+	bool adj_aneg;
+	bool need_adjust;
+	struct delayed_work	link_work;
+	void (*ag71xx_add_atheros_header)(struct sk_buff *skb, u8 ath_hdr_port_byte);
 };
 
 extern struct ethtool_ops ag71xx_ethtool_ops;
 void ag71xx_link_adjust(struct ag71xx *ag);
 
+int ag71xx_mdio_driver_init(void) __init;
+void ag71xx_mdio_driver_exit(void);
+
 int ag71xx_phy_connect(struct ag71xx *ag);
+void ag71xx_phy_connect_for_slaves(struct ag71xx_slave *ags);
 void ag71xx_phy_disconnect(struct ag71xx *ag);
+void ag71xx_phy_start(struct ag71xx *ag);
+void ag71xx_phy_stop(struct ag71xx *ag);
+
+static inline struct ag71xx_platform_data *ag71xx_get_pdata(struct ag71xx *ag)
+{
+	return ag->pdev->dev.platform_data;
+}
 
 static inline int ag71xx_desc_empty(struct ag71xx_desc *desc)
 {
@@ -383,8 +417,23 @@ ag71xx_ring_size_order(int size)
 #define RX_STATUS_OF		BIT(2)	/* Rx Overflow */
 #define RX_STATUS_BE		BIT(3)	/* Bus Error */
 
+static inline void ag71xx_check_reg_offset(struct ag71xx *ag, unsigned reg)
+{
+	switch (reg) {
+	case AG71XX_REG_MAC_CFG1 ... AG71XX_REG_MAC_MFL:
+	case AG71XX_REG_MAC_IFCTL ... AG71XX_REG_TX_SM:
+	case AG71XX_REG_MII_CFG:
+		break;
+
+	default:
+		BUG();
+	}
+}
+
 static inline void ag71xx_wr(struct ag71xx *ag, unsigned reg, u32 value)
 {
+	ag71xx_check_reg_offset(ag, reg);
+
 	__raw_writel(value, ag->mac_base + reg);
 	/* flush write */
 	(void) __raw_readl(ag->mac_base + reg);
@@ -392,6 +441,8 @@ static inline void ag71xx_wr(struct ag71xx *ag, unsigned reg, u32 value)
 
 static inline u32 ag71xx_rr(struct ag71xx *ag, unsigned reg)
 {
+	ag71xx_check_reg_offset(ag, reg);
+
 	return __raw_readl(ag->mac_base + reg);
 }
 
@@ -399,15 +450,19 @@ static inline void ag71xx_sb(struct ag71xx *ag, unsigned reg, u32 mask)
 {
 	void __iomem *r;
 
+	ag71xx_check_reg_offset(ag, reg);
+
 	r = ag->mac_base + reg;
 	__raw_writel(__raw_readl(r) | mask, r);
 	/* flush write */
-	(void) __raw_readl(r);
+	(void)__raw_readl(r);
 }
 
 static inline void ag71xx_cb(struct ag71xx *ag, unsigned reg, u32 mask)
 {
 	void __iomem *r;
+
+	ag71xx_check_reg_offset(ag, reg);
 
 	r = ag->mac_base + reg;
 	__raw_writel(__raw_readl(r) & ~mask, r);
@@ -424,6 +479,32 @@ static inline void ag71xx_int_disable(struct ag71xx *ag, u32 ints)
 {
 	ag71xx_cb(ag, AG71XX_REG_INT_ENABLE, ints);
 }
+
+#ifdef CONFIG_AG71XX_AR8216_SUPPORT
+void ag71xx_add_ar8216_header(struct ag71xx *ag, struct sk_buff *skb);
+int ag71xx_remove_ar8216_header(struct ag71xx *ag, struct sk_buff *skb,
+				int pktlen);
+static inline int ag71xx_has_ar8216(struct ag71xx *ag)
+{
+	return ag71xx_get_pdata(ag)->has_ar8216;
+}
+#else
+static inline void ag71xx_add_ar8216_header(struct ag71xx *ag,
+					   struct sk_buff *skb)
+{
+}
+
+static inline int ag71xx_remove_ar8216_header(struct ag71xx *ag,
+					      struct sk_buff *skb,
+					      int pktlen)
+{
+	return 0;
+}
+static inline int ag71xx_has_ar8216(struct ag71xx *ag)
+{
+	return 0;
+}
+#endif
 
 #ifdef CONFIG_AG71XX_DEBUG_FS
 int ag71xx_debugfs_root_init(void);
@@ -443,12 +524,33 @@ static inline void ag71xx_debugfs_update_napi_stats(struct ag71xx *ag,
 						    int rx, int tx) {}
 #endif /* CONFIG_AG71XX_DEBUG_FS */
 
-int ag71xx_ar7240_init(struct ag71xx *ag, struct device_node *np);
+void ag71xx_ar7240_start(struct ag71xx *ag);
+void ag71xx_ar7240_stop(struct ag71xx *ag);
+int ag71xx_ar7240_init(struct ag71xx *ag);
 void ag71xx_ar7240_cleanup(struct ag71xx *ag);
+int ag71xx_ar7240_get_num_ports(struct ag71xx *ag);
+struct switch_dev *ag71xx_ar7240_get_swdev(struct ag71xx *ag);
+void ag71xx_ar7240_set_port_state(struct ag71xx *ag, unsigned port, int state);
+void ar8327_set_port_state(struct switch_dev *dev, unsigned port, int state);
+int ag71xx_ar7240_get_sw_version(struct ag71xx *ag);
+int ag71xx_ar7240_cook_ags_depending_on_the_sw_ver(struct ag71xx_slave *ags, int sw_ver);
+void ag71xx_add_ar7240_header(struct sk_buff *skb, u8 ath_hdr_port_byte);
+int ag71xx_remove_ar7240_header(struct sk_buff *skb, int pktlen, int *port_num);
+void ag71xx_add_ar934x_header(struct sk_buff *skb, u8 ath_hdr_port_byte);
+int ag71xx_remove_ar934x_header(struct sk_buff *skb, int pktlen, int *port_num);
 
-int ag71xx_setup_gmac(struct device_node *np);
+int ag71xx_mdio_mii_read(struct ag71xx_mdio *am, int addr, int reg);
+void ag71xx_mdio_mii_write(struct ag71xx_mdio *am, int addr, int reg, u16 val);
 
-int ar7240sw_phy_read(struct mii_bus *mii, int addr, int reg);
-int ar7240sw_phy_write(struct mii_bus *mii, int addr, int reg, u16 val);
+u16 ar7240sw_phy_read(struct mii_bus *mii, unsigned phy_addr,
+		      unsigned reg_addr);
+int ar7240sw_phy_write(struct mii_bus *mii, unsigned phy_addr,
+		       unsigned reg_addr, u16 reg_val);
+
+#define ETH_SWITCH_HEADER_LEN	2
+static inline unsigned int ag71xx_max_frame_len(unsigned int mtu)
+{
+	return ETH_SWITCH_HEADER_LEN + ETH_HLEN + VLAN_HLEN + mtu + ETH_FCS_LEN;
+}
 
 #endif /* _AG71XX_H */

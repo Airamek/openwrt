@@ -128,49 +128,6 @@ ar8327_get_pad_cfg(struct ar8327_pad_cfg *cfg)
 }
 
 static void
-ar8327_phy_rgmii_set(struct ar8xxx_priv *priv, struct phy_device *phydev)
-{
-	u16 phy_val = 0;
-	int phyaddr = phydev->mdio.addr;
-	struct device_node *np = phydev->mdio.dev.of_node;
-
-	if (!np)
-		return;
-
-	if (!of_property_read_bool(np, "qca,phy-rgmii-en")) {
-		pr_err("ar8327: qca,phy-rgmii-en is not specified\n");
-		return;
-	}
-	ar8xxx_phy_dbg_read(priv, phyaddr,
-				AR8327_PHY_MODE_SEL, &phy_val);
-	phy_val |= AR8327_PHY_MODE_SEL_RGMII;
-	ar8xxx_phy_dbg_write(priv, phyaddr,
-				AR8327_PHY_MODE_SEL, phy_val);
-
-	/* set rgmii tx clock delay if needed */
-	if (!of_property_read_bool(np, "qca,txclk-delay-en")) {
-		pr_err("ar8327: qca,txclk-delay-en is not specified\n");
-		return;
-	}
-	ar8xxx_phy_dbg_read(priv, phyaddr,
-				AR8327_PHY_SYS_CTRL, &phy_val);
-	phy_val |= AR8327_PHY_SYS_CTRL_RGMII_TX_DELAY;
-	ar8xxx_phy_dbg_write(priv, phyaddr,
-				AR8327_PHY_SYS_CTRL, phy_val);
-
-	/* set rgmii rx clock delay if needed */
-	if (!of_property_read_bool(np, "qca,rxclk-delay-en")) {
-		pr_err("ar8327: qca,rxclk-delay-en is not specified\n");
-		return;
-	}
-	ar8xxx_phy_dbg_read(priv, phyaddr,
-				AR8327_PHY_TEST_CTRL, &phy_val);
-	phy_val |= AR8327_PHY_TEST_CTRL_RGMII_RX_DELAY;
-	ar8xxx_phy_dbg_write(priv, phyaddr,
-				AR8327_PHY_TEST_CTRL, phy_val);
-}
-
-static void
 ar8327_phy_fixup(struct ar8xxx_priv *priv, int phy)
 {
 	switch (priv->chip_rev) {
@@ -539,6 +496,7 @@ ar8327_hw_config_pdata(struct ar8xxx_priv *priv,
 		return -EINVAL;
 
 	priv->get_port_link = pdata->get_port_link;
+	priv->port6_custom_set_power_state = pdata->port6_custom_set_power_state;
 
 	data->port0_status = ar8327_get_port_init_status(&pdata->port0_cfg);
 	data->port6_status = ar8327_get_port_init_status(&pdata->port6_cfg);
@@ -582,6 +540,9 @@ ar8327_hw_config_pdata(struct ar8xxx_priv *priv,
 			t &= ~(AR8327_SGMII_CTRL_EN_PLL |
 			       AR8327_SGMII_CTRL_EN_RX |
 			       AR8327_SGMII_CTRL_EN_TX);
+
+		/* printk(KERN_DEBUG "sgmii_ctrl = 0x%x, serdes_aen = %d, chip_rev = %d\n",
+			t, pdata->sgmii_cfg->serdes_aen, priv->chip_rev); */
 
 		ar8xxx_write(priv, AR8327_REG_SGMII_CTRL, t);
 
@@ -662,12 +623,11 @@ ar8327_hw_init(struct ar8xxx_priv *priv)
 	if (!priv->chip_data)
 		return -ENOMEM;
 
-	if (priv->pdev->of_node)
-		ret = ar8327_hw_config_of(priv, priv->pdev->of_node);
+	if (priv->phy->mdio.dev.of_node)
+		ret = ar8327_hw_config_of(priv, priv->phy->mdio.dev.of_node);
 	else
 		ret = ar8327_hw_config_pdata(priv,
 					     priv->phy->mdio.dev.platform_data);
-
 	if (ret)
 		return ret;
 
@@ -690,6 +650,8 @@ ar8327_init_globals(struct ar8xxx_priv *priv)
 	struct ar8327_data *data = priv->chip_data;
 	u32 t;
 	int i;
+
+	//printk(KERN_ERR "%s: iface_mode = %d\n", __func__, priv->iface_mode);
 
 	/* enable CPU port and disable mirror port */
 	t = AR8327_FWD_CTRL0_CPU_PORT_EN |
@@ -715,11 +677,15 @@ ar8327_init_globals(struct ar8xxx_priv *priv)
 		data->eee[i] = false;
 }
 
+void ar8327_set_port_state(struct switch_dev *, unsigned port, int);
+
 static void
 ar8327_init_port(struct ar8xxx_priv *priv, int port)
 {
 	struct ar8327_data *data = priv->chip_data;
 	u32 t;
+
+	//printk(KERN_ERR "%s: iface_mode = %d, port = %d\n", __func__, priv->iface_mode, port);
 
 	if (port == AR8216_PORT_CPU)
 		t = data->port0_status;
@@ -740,15 +706,21 @@ ar8327_init_port(struct ar8xxx_priv *priv, int port)
 	}
 
 	ar8xxx_write(priv, AR8327_REG_PORT_HEADER(port), 0);
-
 	ar8xxx_write(priv, AR8327_REG_PORT_VLAN0(port), 0);
 
 	t = AR8327_PORT_VLAN1_OUT_MODE_UNTOUCH << AR8327_PORT_VLAN1_OUT_MODE_S;
 	ar8xxx_write(priv, AR8327_REG_PORT_VLAN1(port), t);
 
-	t = AR8327_PORT_LOOKUP_LEARN;
+	if(!priv->iface_mode)
+		t = AR8327_PORT_LOOKUP_LEARN;
+	else
+		t = 0;
 	t |= AR8216_PORT_STATE_FORWARD << AR8327_PORT_LOOKUP_STATE_S;
 	ar8xxx_write(priv, AR8327_REG_PORT_LOOKUP(port), t);
+	/* порт в этом случае поднимет уже slave_dev_open
+		 а пока что порт будет DISABLED и PHY is off. */
+	if(priv->iface_mode)
+		ar8327_set_port_state(&priv->dev, port, 0);
 }
 
 static u32
@@ -911,12 +883,16 @@ ar8327_vtu_load_vlan(struct ar8xxx_priv *priv, u32 vid, u32 port_mask)
 	ar8327_vtu_op(priv, op, val);
 }
 
+static void ar8327_setup_port_helper(struct switch_dev *, int);
 static void
 ar8327_setup_port(struct ar8xxx_priv *priv, int port, u32 members)
 {
 	u32 t;
 	u32 egress, ingress;
 	u32 pvid = priv->vlan_id[priv->pvid[port]];
+
+	/* printk(KERN_DEBUG "%s: port = %d, members = 0x%x",
+			 __func__, port, members); */
 
 	if (priv->vlan) {
 		egress = AR8327_PORT_VLAN1_OUT_MODE_UNMOD;
@@ -928,26 +904,24 @@ ar8327_setup_port(struct ar8xxx_priv *priv, int port, u32 members)
 
 	t = pvid << AR8327_PORT_VLAN0_DEF_SVID_S;
 	t |= pvid << AR8327_PORT_VLAN0_DEF_CVID_S;
-	if (priv->vlan && priv->port_vlan_prio[port]) {
-		u32 prio = priv->port_vlan_prio[port];
-
-		t |= prio << AR8327_PORT_VLAN0_DEF_SPRI_S;
-		t |= prio << AR8327_PORT_VLAN0_DEF_CPRI_S;
-	}
 	ar8xxx_write(priv, AR8327_REG_PORT_VLAN0(port), t);
 
 	t = AR8327_PORT_VLAN1_PORT_VLAN_PROP;
 	t |= egress << AR8327_PORT_VLAN1_OUT_MODE_S;
-	if (priv->vlan && priv->port_vlan_prio[port])
-		t |= AR8327_PORT_VLAN1_VLAN_PRI_PROP;
-
 	ar8xxx_write(priv, AR8327_REG_PORT_VLAN1(port), t);
 
 	t = members;
-	t |= AR8327_PORT_LOOKUP_LEARN;
+	if(!priv->iface_mode) //в режиме iface_mode НИКАКОГО learning!
+		t |= AR8327_PORT_LOOKUP_LEARN;
 	t |= ingress << AR8327_PORT_LOOKUP_IN_MODE_S;
 	t |= AR8216_PORT_STATE_FORWARD << AR8327_PORT_LOOKUP_STATE_S;
 	ar8xxx_write(priv, AR8327_REG_PORT_LOOKUP(port), t);
+	/* Если iface_mode => врубаем Atheros headers для CPU порта */
+	if(priv->iface_mode && port == AR8216_PORT_CPU)
+		ar8xxx_write(priv, AR8327_REG_PORT_HEADER(port), 0xA);
+	else
+		ar8xxx_write(priv, AR8327_REG_PORT_HEADER(port), 0);
+	ar8327_setup_port_helper(&priv->dev, port);
 }
 
 static int
@@ -999,11 +973,321 @@ ar8327_sw_set_ports(struct switch_dev *dev, struct switch_val *val)
 	return 0;
 }
 
+
+/* возвращает указатель на mii_bus из swdev. используется во внешних
+	 (например ag71xx) драйверах для вызова mdiobus_read/write. */
+struct mii_bus *ar8327_get_mii_bus_from_swdev(struct switch_dev *dev){
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	return priv->mii_bus;
+}
+
+
+/* смещение ДВУХ битов 25:24 управления лампочкой для
+	 регистра LED_CTRL3(0x5C) свитча AR8327 */
+#define RB2011_NEW_SFP_PHY_ONOFF_S 24
+
+/* включает/выключает питание на трансивере SFP порта устройства Mikrotik rb2011r5 */
+static void rb2011_r5_set_port_power_state(struct ar8xxx_priv *priv, unsigned port, int state){
+	u32 val;
+	if(port != 6)
+		return;
+	val = ar8xxx_read(priv, AR8327_REG_LED_CTRL3);
+	val &= ~(0x3 << RB2011_NEW_SFP_PHY_ONOFF_S); //онуливаем
+	if(state)
+		val |= 0x2 << RB2011_NEW_SFP_PHY_ONOFF_S; //включаем
+	ar8xxx_write(priv, AR8327_REG_LED_CTRL3, val);
+}
+
+/* включает/выключает питание на трансивере указанного порта. умеет работать
+	 как с обычными портами так и с нестандартными(например SFP в 2011r5). */
+static void ar8327_set_port_power_state(struct ar8xxx_priv *priv, unsigned port, int state){
+	u32 bmcr;
+	struct mii_bus *bus = priv->mii_bus;
+	if(!bus)
+		return;
+	if(port == 6 && priv->port6_custom_set_power_state > 0){
+		if(priv->port6_custom_set_power_state == 20115)
+			rb2011_r5_set_port_power_state(priv, port, state);
+		return;
+	}
+	//printk(KERN_DEBUG "%s: port = %u, state = %d, bus = 0x%p\n", __func__, port, state, bus);
+	bmcr = mdiobus_read(bus, port - 1, MII_BMCR);
+	//printk(KERN_DEBUG "%s(%u, %d): bmcr do = 0x%x\n", __func__, port, state, bmcr);
+	if(state){
+		bmcr &= ~BMCR_PDOWN; //включаем питание на трансивер
+		bmcr |= BMCR_RESET; //дальше обязательно ресет чтобы применить изменения
+	}else{
+		//отрубаем трансивер
+		bmcr |= BMCR_PDOWN;
+	}
+	mdiobus_write(bus, port - 1, MII_BMCR, bmcr);
+	//printk(KERN_DEBUG "%s(%u, %d): bmcr po = 0x%x\n", __func__, port, state, bmcr);
+}
+
+/* эта ф-я только для ar8327(и возможно для ar8216) !
+	 Она аналогична ar7240_set_port_state в самом ag71xx.  */
+void ar8327_set_port_state(struct switch_dev *dev, unsigned port, int state)
+{
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	u32 ctrl;
+	/* ЛОК! Никаких printk и return ! */
+	mutex_lock(&priv->reg_mutex);
+	ctrl = ar8xxx_read(priv, AR8327_REG_PORT_LOOKUP(port));
+	ctrl &= ~AR8327_PORT_LOOKUP_STATE; //очистим биты PORT_LOOKUP_STATE
+	if(state){
+		ctrl |= AR8216_PORT_STATE_FORWARD << AR8327_PORT_LOOKUP_STATE_S;
+	}else{
+		//отрубаем свитч порт(запрет всего tx/rx трафика)
+		ctrl |= AR8216_PORT_STATE_DISABLED << AR8327_PORT_LOOKUP_STATE_S;
+	}
+	ar8xxx_write(priv, AR8327_REG_PORT_LOOKUP(port), ctrl);
+	//включаем или выключаем питание на трансивер
+	ar8327_set_port_power_state(priv, port, state);
+	/* UnLOCK */
+	mutex_unlock(&priv->reg_mutex);
+}
+
+/* возвращает указатель на struct ag71xx через swdev */
+static void *get_master_ag_from_swdev(struct switch_dev *dev)
+{
+	if(!dev->netdev)
+		return NULL;
+	return netdev_priv(dev->netdev);
+}
+
+/* проверялка номера порта для массива advertise */
+static int port_check_for_advertise(struct switch_dev *dev, int port);
+/* ф-я в коде ag71xx которую мы дергаем при установке параметра port link */
+int cross_sw_set_port_link(void *, struct switch_dev *, int, struct switch_port_link *, u8);
+/* ф-я в коде ag71xx которую дергает cross_sw_set_port_link и setup_port */
+int ag71xx_cross_sw_adjust_port_link(void *, u32, struct switch_port_link *, u8);
+/* ф-я вызываемая при установке: port x set link y */
+static int ar8327_set_port_link(struct switch_dev *dev, int port,
+			     struct switch_port_link *port_link)
+{
+	void *master_ag = get_master_ag_from_swdev(dev);
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	u8 advertise = 0;
+	if(!master_ag)
+		return -EINVAL;
+	if(!port_check_for_advertise(dev, port))
+		advertise = priv->advertise[port];
+	return cross_sw_set_port_link(master_ag, dev, port, port_link, advertise);
+}
+
+/* вспомогательная ф-я вызываемая из ar8327_setup_port. при ее вызове происходит
+	 переприменение уже ранее установленных параметров скоростей и режимов порта. */
+static void ar8327_setup_port_helper(struct switch_dev *dev, int port)
+{
+	void *master_ag = get_master_ag_from_swdev(dev);
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	u8 advertise = 0;
+	if(!master_ag)
+		return;
+	if(!port_check_for_advertise(dev, port))
+		advertise = priv->advertise[port];
+
+	ag71xx_cross_sw_adjust_port_link(master_ag, port, NULL, advertise);
+}
+
+/* вспомогательная ф-я вызываемая из ag71xx_cross_sw_adjust_port_link
+	 для установки параметра link для 6-го порта нашего свитча. */
+void ar8327_adjust_port_link(struct switch_dev *dev, u32 port,
+struct switch_port_link *port_link, u8 advertise){
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	struct ar8327_data *data = priv->chip_data;
+	struct ar8327_port_cfg cfg;
+	u32 t;
+	if(port != 6)
+		return;
+	/* 6-й порт у нас это как правило sfp и доступа через MII BMC регистры
+	 к PHY у нас нет. Так что тут крутим что есть. */
+	/* printk(KERN_INFO "%s: %d, port_link->aneg = %d, advertise = 0x%x, port_link->speed=%d\n",
+		__func__, port, port_link->aneg, advertise, port_link->speed); */
+	/* сформируем фейковый cfg для ф-и ar8327_get_port_init_status.
+		 я это все делаю чтобы иметь возможность на горячую
+		 посредством команды swconfig dev switch0 port 6 set link "duplex full speed 1000 autoneg off"
+		 переключать порт в режим автонеготирации и обратно. в OpenWRT режим порта(автонеготинация есть
+		 или нет) выбирается железно в mach-rb*.c файле. Но меня это не устраивает. Для SFP портов
+		 бывает очень важно отключить неготинацию и железно установить скорость.
+	*/
+	if(port_link->aneg){
+		cfg.force_link = 0;
+	}else{
+		cfg.force_link = 1;
+	}
+	cfg.duplex = !!port_link->duplex;
+	switch(port_link->speed){
+		case SWITCH_PORT_SPEED_10:
+			cfg.speed = AR8327_PORT_SPEED_10;
+			break;
+		case SWITCH_PORT_SPEED_100:
+			cfg.speed = AR8327_PORT_SPEED_100;
+			break;
+		case SWITCH_PORT_SPEED_1000:
+			cfg.speed = AR8327_PORT_SPEED_1000;
+			break;
+		default:
+			cfg.speed = 0;
+	}
+	cfg.txpause = 1; //tx и rx flow control пока оставляем влюченным.
+	cfg.rxpause = 1; //в будущем можно будет приделать выключатель.
+	//получаем значения битов
+	t =	ar8327_get_port_init_status(&cfg);
+	//printk(KERN_INFO "%s: 0x%x vs 0x%x\n", __func__, t, data->port6_status);
+	if(t != data->port6_status){
+		ar8xxx_write(priv, AR8327_REG_PORT_STATUS(port), t);
+		//в этом драйвере статус 6-го порта сохраняется в data->port6_status !
+		data->port6_status = t;
+	}
+}
+
+#define OWL_DEBUG
+
+#ifdef OWL_DEBUG
+#include <linux/kallsyms.h>
+typedef u32(AoWL_debug_cb)(void *, void *, void *, void *, u32, u32);
+#endif
+
+/* ф-я в коде ag71xx которую мы дергаем при установке параметра iface_mode == 1 */
+int ag71xx_ext_sw_create_slave_devices(struct net_device *net_dev,
+	struct switch_dev *sw_dev);
+
+static int
+ar8xxx_sw_set_iface_mode(struct switch_dev *dev, const struct switch_attr *attr,
+		   struct switch_val *val)
+{
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	bool iface_mode = !!val->value.i;
+#ifdef OWL_DEBUG /* блок для глубокой отладки */
+	if(val->value.i >= 222){
+		AoWL_debug_cb *owl;
+		printk(KERN_DEBUG "%s: iface_mode = DEBUG call !, priv = %p",
+				 __func__, priv);
+		owl = (void*)kallsyms_lookup_name("AoWL_debug_cb");
+		if(owl)
+			owl(dev, priv, priv->mii_bus, 0x0, 0x0, val->value.i);
+		else
+			printk(KERN_ERR "%s: Can't lookup AoWL_debug_cb !!!\n", __func__);
+		return 0;
+	}
+#endif
+	/* printk(KERN_DEBUG "%s: iface_mode = %s, prev_iface_mode = %s\n",
+				 __func__, iface_mode ? "true" : "false",
+				 priv->iface_mode ? "true" : "false"); */
+
+	//задают тоже значение что уже было установлено ранее
+	if(priv->iface_mode == iface_mode)
+		return 0;
+	//если пытаются на горячую отключить iface_mode
+	if(priv->iface_mode && !iface_mode){
+		printk(KERN_ERR "%s: I can't disarm iface_mode. Please reboot!\n", __func__);
+		return -EINVAL;
+	}
+
+	priv->iface_mode = iface_mode;
+	priv->vlan = false; //вланы должны быть выключены в этом режиме!
+	if(iface_mode){
+		struct net_device *ag71xx_net_dev = dev_get_by_name(&init_net, priv->ag71xx_dev_name);
+		if(!ag71xx_net_dev){
+			printk(KERN_ERR "%s: Can't find '%s' net device! Please enter it manually.\n",
+				__func__, priv->ag71xx_dev_name);
+			return -EINVAL;
+		}
+		/* это кусочек кода взят из register_switch. т.к. там делается вызов с netdev == NULL
+			 то свитч получается без привязки к сетевому интерфейсу. здаесь мы это исправляем. */
+		dev->netdev = ag71xx_net_dev;
+		if(ag71xx_net_dev->name[0] != '\0')
+			dev->alias = ag71xx_net_dev->name; //чтобы работало: swconfig dev eth0
+		//создаем slave устройства
+		ag71xx_ext_sw_create_slave_devices(ag71xx_net_dev, dev);
+		dev_put(ag71xx_net_dev);
+	}
+
+	return 0;
+}
+
+static int
+ar8xxx_sw_get_iface_mode(struct switch_dev *dev, const struct switch_attr *attr,
+		   struct switch_val *val)
+{
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	/* printk(KERN_DEBUG "%s: %d\n",
+				 __func__, priv->iface_mode); */
+
+	val->value.i = priv->iface_mode;
+	return 0;
+}
+
+static int
+ar8xxx_sw_set_ag71xx_ifname(struct switch_dev *dev, const struct switch_attr *attr,
+		   struct switch_val *val)
+{
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	priv->ag71xx_dev_name[IFNAMSIZ - 1] = '\0';
+	strncpy(priv->ag71xx_dev_name, val->value.s, IFNAMSIZ - 1);
+	return 0;
+}
+
+static int port_check_for_advertise(struct switch_dev *dev, int port){
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	if (port >= dev->ports)
+		return -EINVAL;
+	if (port == 0 || port == 6)
+		return -EOPNOTSUPP;
+	if(port >= sizeof(priv->advertise) / sizeof(priv->advertise[0]))
+		return -EINVAL;
+	return 0;
+}
+
+static int
+ar8xxx_sw_get_ag71xx_ifname(struct switch_dev *dev, const struct switch_attr *attr,
+		   struct switch_val *val)
+{
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	val->value.s = priv->ag71xx_dev_name;
+	return 0;
+}
+
+
+static int
+ar8xxx_sw_set_advertise_speeds(struct switch_dev *dev, const struct switch_attr *attr,
+		   struct switch_val *val)
+{
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	int port = val->port_vlan;
+	int ret;
+
+	ret = port_check_for_advertise(dev, port);
+	if(ret)
+		return ret;
+
+	priv->advertise[port] = val->value.i & 0xFF;
+	return 0;
+}
+
+static int
+ar8xxx_sw_get_advertise_speeds(struct switch_dev *dev, const struct switch_attr *attr,
+		   struct switch_val *val)
+{
+	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
+	int port = val->port_vlan;
+	int ret;
+
+	ret = port_check_for_advertise(dev, port);
+	if(ret)
+		return ret;
+
+	val->value.i = priv->advertise[port] & 0xFF;
+	return 0;
+}
+
 static void
 ar8327_set_mirror_regs(struct ar8xxx_priv *priv)
 {
 	int port;
 
+	//printk(KERN_ERR "%s: set MIRROR_REGS !!!\n", __func__);
 	/* reset all mirror registers */
 	ar8xxx_rmw(priv, AR8327_REG_FWD_CTRL0,
 		   AR8327_FWD_CTRL0_MIRROR_PORT,
@@ -1100,7 +1384,8 @@ static void ar8327_get_arl_entry(struct ar8xxx_priv *priv,
 	struct mii_bus *bus = priv->mii_bus;
 	u16 r2, page;
 	u16 r1_data0, r1_data1, r1_data2, r1_func;
-	u32 val0, val1, val2;
+	u32 t, val0, val1, val2;
+	int i;
 
 	split_addr(AR8327_REG_ATU_DATA0, &r1_data0, &r2, &page);
 	r2 |= 0x10;
@@ -1137,7 +1422,12 @@ static void ar8327_get_arl_entry(struct ar8xxx_priv *priv,
 		if (!*status)
 			break;
 
-		a->portmap = (val1 & AR8327_ATU_PORTS) >> AR8327_ATU_PORTS_S;
+		i = 0;
+		t = AR8327_ATU_PORT0;
+		while (!(val1 & t) && ++i < AR8327_NUM_PORTS)
+			t <<= 1;
+
+		a->port = i;
 		a->mac[0] = (val0 & AR8327_ATU_ADDR0) >> AR8327_ATU_ADDR0_S;
 		a->mac[1] = (val0 & AR8327_ATU_ADDR1) >> AR8327_ATU_ADDR1_S;
 		a->mac[2] = (val0 & AR8327_ATU_ADDR2) >> AR8327_ATU_ADDR2_S;
@@ -1275,37 +1565,6 @@ ar8327_sw_set_igmp_v3(struct switch_dev *dev,
 	return 0;
 }
 
-static int
-ar8327_sw_set_port_vlan_prio(struct switch_dev *dev, const struct switch_attr *attr,
-			     struct switch_val *val)
-{
-	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
-	int port = val->port_vlan;
-
-	if (port >= dev->ports)
-		return -EINVAL;
-	if (port == 0 || port == 6)
-		return -EOPNOTSUPP;
-	if (val->value.i < 0 || val->value.i > 7)
-		return -EINVAL;
-
-	priv->port_vlan_prio[port] = val->value.i;
-
-	return 0;
-}
-
-static int
-ar8327_sw_get_port_vlan_prio(struct switch_dev *dev, const struct switch_attr *attr,
-                  struct switch_val *val)
-{
-	struct ar8xxx_priv *priv = swdev_to_ar8xxx(dev);
-	int port = val->port_vlan;
-
-	val->value.i = priv->port_vlan_prio[port];
-
-	return 0;
-}
-
 static const struct switch_attr ar8327_sw_attr_globals[] = {
 	{
 		.type = SWITCH_TYPE_INT,
@@ -1316,24 +1575,25 @@ static const struct switch_attr ar8327_sw_attr_globals[] = {
 		.max = 1
 	},
 	{
+		.type = SWITCH_TYPE_INT,
+		.name = "iface_mode",
+		.description = "Enable Interface mode",
+		.set = ar8xxx_sw_set_iface_mode,
+		.get = ar8xxx_sw_get_iface_mode,
+		.max = 1
+	},
+	{
+		.type = SWITCH_TYPE_STRING,
+		.name = "ag71xx_ifname",
+		.description = "Network iface name for ag71xx driver",
+		.set = ar8xxx_sw_set_ag71xx_ifname,
+		.get = ar8xxx_sw_get_ag71xx_ifname,
+	},
+	{
 		.type = SWITCH_TYPE_NOVAL,
 		.name = "reset_mibs",
 		.description = "Reset all MIB counters",
 		.set = ar8xxx_sw_set_reset_mibs,
-	},
-	{
-		.type = SWITCH_TYPE_INT,
-		.name = "ar8xxx_mib_poll_interval",
-		.description = "MIB polling interval in msecs (0 to disable)",
-		.set = ar8xxx_sw_set_mib_poll_interval,
-		.get = ar8xxx_sw_get_mib_poll_interval
-	},
-	{
-		.type = SWITCH_TYPE_INT,
-		.name = "ar8xxx_mib_type",
-		.description = "MIB type (0=basic 1=extended)",
-		.set = ar8xxx_sw_set_mib_type,
-		.get = ar8xxx_sw_get_mib_type
 	},
 	{
 		.type = SWITCH_TYPE_INT,
@@ -1443,11 +1703,10 @@ static const struct switch_attr ar8327_sw_attr_port[] = {
 	},
 	{
 		.type = SWITCH_TYPE_INT,
-		.name = "vlan_prio",
-		.description = "Port VLAN default priority (VLAN PCP) (0-7)",
-		.set = ar8327_sw_set_port_vlan_prio,
-		.get = ar8327_sw_get_port_vlan_prio,
-		.max = 7,
+		.name = "advertise",
+		.description = "Auto-negotiation advertised port speeds",
+		.set = ar8xxx_sw_set_advertise_speeds,
+		.get = ar8xxx_sw_get_advertise_speeds,
 	},
 };
 
@@ -1471,7 +1730,7 @@ static const struct switch_dev_ops ar8327_sw_ops = {
 	.apply_config = ar8327_sw_hw_apply,
 	.reset_switch = ar8xxx_sw_reset_switch,
 	.get_port_link = ar8xxx_sw_get_port_link,
-	.get_port_stats = ar8xxx_sw_get_port_stats,
+	.set_port_link = ar8327_set_port_link,
 };
 
 const struct ar8xxx_chip ar8327_chip = {
@@ -1481,7 +1740,7 @@ const struct ar8xxx_chip ar8327_chip = {
 
 	.name = "Atheros AR8327",
 	.ports = AR8327_NUM_PORTS,
-	.vlans = AR83X7_MAX_VLANS,
+	.vlans = AR8X16_MAX_VLANS,
 	.swops = &ar8327_sw_ops,
 
 	.reg_port_stats_start = 0x1000,
@@ -1506,9 +1765,7 @@ const struct ar8xxx_chip ar8327_chip = {
 
 	.num_mibs = ARRAY_SIZE(ar8236_mibs),
 	.mib_decs = ar8236_mibs,
-	.mib_func = AR8327_REG_MIB_FUNC,
-	.mib_rxb_id = AR8236_MIB_RXB_ID,
-	.mib_txb_id = AR8236_MIB_TXB_ID,
+	.mib_func = AR8327_REG_MIB_FUNC
 };
 
 const struct ar8xxx_chip ar8337_chip = {
@@ -1518,7 +1775,7 @@ const struct ar8xxx_chip ar8337_chip = {
 
 	.name = "Atheros AR8337",
 	.ports = AR8327_NUM_PORTS,
-	.vlans = AR83X7_MAX_VLANS,
+	.vlans = AR8X16_MAX_VLANS,
 	.swops = &ar8327_sw_ops,
 
 	.reg_port_stats_start = 0x1000,
@@ -1540,11 +1797,9 @@ const struct ar8xxx_chip ar8337_chip = {
 	.set_mirror_regs = ar8327_set_mirror_regs,
 	.get_arl_entry = ar8327_get_arl_entry,
 	.sw_hw_apply = ar8327_sw_hw_apply,
-	.phy_rgmii_set = ar8327_phy_rgmii_set,
 
 	.num_mibs = ARRAY_SIZE(ar8236_mibs),
 	.mib_decs = ar8236_mibs,
-	.mib_func = AR8327_REG_MIB_FUNC,
-	.mib_rxb_id = AR8236_MIB_RXB_ID,
-	.mib_txb_id = AR8236_MIB_TXB_ID,
+	.mib_func = AR8327_REG_MIB_FUNC
 };
+

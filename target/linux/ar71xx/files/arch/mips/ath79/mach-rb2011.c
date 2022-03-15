@@ -18,11 +18,7 @@
 #include <linux/ath9k_platform.h>
 #include <linux/ar8216_platform.h>
 #include <linux/mtd/mtd.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
-#include <linux/mtd/nand.h>
-#else
 #include <linux/mtd/rawnand.h>
-#endif
 #include <linux/mtd/partitions.h>
 #include <linux/spi/spi.h>
 #include <linux/spi/flash.h>
@@ -37,14 +33,22 @@
 #include "common.h"
 #include "dev-eth.h"
 #include "dev-m25p80.h"
+#include "dev-gpio-buttons.h"
 #include "dev-nfc.h"
 #include "dev-usb.h"
 #include "dev-wmac.h"
 #include "machtypes.h"
 #include "routerboot.h"
 
+#define RB2011_GPIO_PORT10_POE 2
 #define RB2011_GPIO_NAND_NCE	14
+#define RB2011_GPIO_BTN_RESET	15
+#define RB2011_GPIO_USB_POE	20
 #define RB2011_GPIO_SFP_LOS	21
+#define RB2011_GPIO_SPEAKER	22
+
+#define RBHAPX_KEYS_POLL_INTERVAL 20 /* msecs */
+#define RBHAPX_KEYS_DEBOUNCE_INTERVAL (3 * RBHAPX_KEYS_POLL_INTERVAL)
 
 #define RB_ROUTERBOOT_OFFSET	0x0000
 #define RB_ROUTERBOOT_MIN_SIZE	0xb000
@@ -56,9 +60,10 @@
 
 #define RB_ART_SIZE		0x10000
 
-#define RB2011_FLAG_SFP		BIT(0)
-#define RB2011_FLAG_USB		BIT(1)
-#define RB2011_FLAG_WLAN	BIT(2)
+#define RB2011_FLAG_OLD_SFP		BIT(0)
+#define RB2011_FLAG_NEW_SFP		BIT(1)
+#define RB2011_FLAG_USB				BIT(2)
+#define RB2011_FLAG_WLAN			BIT(3)
 
 static struct mtd_partition rb2011_spi_partitions[] = {
 	{
@@ -125,12 +130,12 @@ static struct ar8327_sgmii_cfg rb2011_ar8327_sgmii_cfg;
 static struct ar8327_led_cfg rb2011_ar8327_led_cfg = {
 	.led_ctrl0 = 0xc731c731,
 	.led_ctrl1 = 0x00000000,
-	.led_ctrl2 = 0x00000000,
+	.led_ctrl2 = 0x00008000, //shut down led on LCD screen(sw LED PORT 2)
 	.led_ctrl3 = 0x0030c300,
 	.open_drain = false,
 };
 
-static const struct ar8327_led_info rb2011_ar8327_leds[] = {
+static const struct ar8327_led_info rb2011_ar8327_leds[] __initconst = {
 	AR8327_LED_INFO(PHY0_0, HW, "rb:green:eth1"),
 	AR8327_LED_INFO(PHY1_0, HW, "rb:green:eth2"),
 	AR8327_LED_INFO(PHY2_0, HW, "rb:green:eth3"),
@@ -142,6 +147,13 @@ static const struct ar8327_led_info rb2011_ar8327_leds[] = {
 	AR8327_LED_INFO(PHY3_1, SW, "rb:green:eth9"),
 	AR8327_LED_INFO(PHY4_1, SW, "rb:green:eth10"),
 	AR8327_LED_INFO(PHY4_2, SW, "rb:green:usr"),
+	{
+		.name = "rb:lcd:led",
+		.led_num = AR8327_LED_PHY0_2,
+		.mode = AR8327_LED_MODE_SW,
+		.active_low = 0,
+		.default_trigger = "default-on",
+	}
 };
 
 static struct ar8327_platform_data rb2011_ar8327_data = {
@@ -163,6 +175,17 @@ static struct mdio_board_info rb2011_mdio0_info[] = {
 		.bus_id = "ag71xx-mdio.0",
 		.mdio_addr = 0,
 		.platform_data = &rb2011_ar8327_data,
+	},
+};
+
+static struct gpio_keys_button rb2011_gpio_keys[] __initdata = {
+	{
+		.desc = "Reset button",
+		.type = EV_KEY,
+		.code = KEY_RESTART,
+		.debounce_interval = RBHAPX_KEYS_DEBOUNCE_INTERVAL,
+		.gpio = RB2011_GPIO_BTN_RESET,
+		.active_low = 1,
 	},
 };
 
@@ -193,16 +216,6 @@ static void rb2011_nand_select_chip(int chip_no)
 	}
 	ndelay(500);
 }
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,6,0)
-static struct nand_ecclayout rb2011_nand_ecclayout = {
-	.eccbytes	= 6,
-	.eccpos		= { 8, 9, 10, 13, 14, 15 },
-	.oobavail	= 9,
-	.oobfree	= { { 0, 4 }, { 6, 2 }, { 11, 2 }, { 4, 1 } }
-};
-
-#else
 
 static int rb2011_ooblayout_ecc(struct mtd_info *mtd, int section,
 				struct mtd_oob_region *oobregion)
@@ -250,30 +263,20 @@ static const struct mtd_ooblayout_ops rb2011_nand_ecclayout_ops = {
 	.ecc = rb2011_ooblayout_ecc,
 	.free = rb2011_ooblayout_free,
 };
-#endif /* < 4.6 */
 
 static int rb2011_nand_scan_fixup(struct mtd_info *mtd)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,6,0)
-	struct nand_chip *chip = mtd->priv;
-#else
 	struct nand_chip *chip = mtd_to_nand(mtd);
-#endif /* < 4.6.0 */
 
 	if (mtd->writesize == 512) {
 		/*
 		 * Use the OLD Yaffs-1 OOB layout, otherwise RouterBoot
 		 * will not be able to find the kernel that we load.
 		 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,6,0)
-		chip->ecc.layout = &rb2011_nand_ecclayout;
-#else
 		mtd_set_ooblayout(mtd, &rb2011_nand_ecclayout_ops);
-#endif
 	}
 
 	chip->options = NAND_NO_SUBPAGE_WRITE;
-
 	return 0;
 }
 
@@ -289,7 +292,7 @@ static void __init rb2011_nand_init(void)
 	ath79_register_nfc();
 }
 
-static int rb2011_get_port_link(unsigned port)
+static int rb2011_old_get_port_link(unsigned port)
 {
 	if (port != 6)
 		return -EINVAL;
@@ -298,7 +301,8 @@ static int rb2011_get_port_link(unsigned port)
 	return !gpio_get_value(RB2011_GPIO_SFP_LOS);
 }
 
-static void __init rb2011_sfp_init(void)
+
+static void __init rb2011_old_sfp_init(void)
 {
 	gpio_request_one(RB2011_GPIO_SFP_LOS, GPIOF_IN, "SFP LOS");
 
@@ -315,7 +319,29 @@ static void __init rb2011_sfp_init(void)
 	rb2011_ar8327_data.port6_cfg.speed = AR8327_PORT_SPEED_1000;
 	rb2011_ar8327_data.port6_cfg.duplex = 1;
 
-	rb2011_ar8327_data.get_port_link = rb2011_get_port_link;
+	rb2011_ar8327_data.get_port_link = rb2011_old_get_port_link;
+}
+
+
+static void __init rb2011_new_sfp_init(void)
+{
+	rb2011_ar8327_pad6_cfg.mode = AR8327_PAD_MAC_SGMII;
+	rb2011_ar8327_pad6_cfg.rxclk_delay_en = true;
+	rb2011_ar8327_pad6_cfg.rxclk_delay_sel = AR8327_CLK_DELAY_SEL0;
+
+	rb2011_ar8327_data.pad6_cfg = &rb2011_ar8327_pad6_cfg;
+
+	rb2011_ar8327_sgmii_cfg.sgmii_ctrl = 0xc701e7d0;
+	rb2011_ar8327_sgmii_cfg.serdes_aen = true; //autonegotination
+
+	rb2011_ar8327_data.sgmii_cfg = &rb2011_ar8327_sgmii_cfg;
+
+	rb2011_ar8327_data.port6_cfg.force_link = 0;
+	rb2011_ar8327_data.port6_cfg.speed = AR8327_PORT_SPEED_1000;
+	rb2011_ar8327_data.port6_cfg.duplex = 1;
+	rb2011_ar8327_data.port6_cfg.txpause = 1;
+	rb2011_ar8327_data.port6_cfg.rxpause = 1;
+	rb2011_ar8327_data.port6_custom_set_power_state = 20115;
 }
 
 static int __init rb2011_setup(u32 flags)
@@ -337,7 +363,7 @@ static int __init rb2011_setup(u32 flags)
 	rb2011_nand_init();
 
 	ath79_setup_ar934x_eth_cfg(AR934X_ETH_CFG_RGMII_GMAC0 |
-				   AR934X_ETH_CFG_RXD_DELAY |
+					 AR934X_ETH_CFG_RXD_DELAY |
 				   AR934X_ETH_CFG_SW_ONLY_MODE);
 
 	ath79_register_mdio(1, 0x0);
@@ -351,7 +377,8 @@ static int __init rb2011_setup(u32 flags)
 	ath79_eth0_data.phy_if_mode = PHY_INTERFACE_MODE_RGMII;
 	ath79_eth0_data.phy_mask = BIT(0);
 	ath79_eth0_data.mii_bus_dev = &ath79_mdio0_device.dev;
-	ath79_eth0_pll_data.pll_1000 = 0x6f000000;
+	ath79_eth0_pll_data.pll_1000 = 0x6f000000; //here tx/rx delay is more.
+	//ath79_eth0_pll_data.pll_1000 = 0x2000000; //also work!
 
 	ath79_register_eth(0);
 
@@ -363,14 +390,25 @@ static int __init rb2011_setup(u32 flags)
 
 	ath79_register_eth(1);
 
-	if (flags & RB2011_FLAG_SFP)
-		rb2011_sfp_init();
+	if (flags & RB2011_FLAG_OLD_SFP)
+		rb2011_old_sfp_init();
+
+	if (flags & RB2011_FLAG_NEW_SFP)
+		rb2011_new_sfp_init();
 
 	if (flags & RB2011_FLAG_WLAN)
 		rb2011_wlan_init();
 
-	if (flags & RB2011_FLAG_USB)
+	if (flags & RB2011_FLAG_USB){
 		ath79_register_usb();
+		gpio_request_one(RB2011_GPIO_USB_POE, GPIOF_ACTIVE_LOW |
+			GPIOF_OUT_INIT_LOW | GPIOF_EXPORT_DIR_FIXED, "USB power off");
+	}
+	gpio_request_one(RB2011_GPIO_PORT10_POE, GPIOF_OUT_INIT_LOW |
+		GPIOF_EXPORT_DIR_FIXED, "Port10 PoE");
+
+	ath79_register_gpio_keys_polled(-1, RBHAPX_KEYS_POLL_INTERVAL,
+		ARRAY_SIZE(rb2011_gpio_keys), rb2011_gpio_keys);
 
 	return 0;
 }
@@ -384,21 +422,22 @@ MIPS_MACHINE_NONAME(ATH79_MACH_RB_2011L, "2011L", rb2011l_setup);
 
 static void __init rb2011us_setup(void)
 {
-	rb2011_setup(RB2011_FLAG_SFP | RB2011_FLAG_USB);
+	rb2011_setup(RB2011_FLAG_OLD_SFP | RB2011_FLAG_USB);
 }
 
 MIPS_MACHINE_NONAME(ATH79_MACH_RB_2011US, "2011US", rb2011us_setup);
 
 static void __init rb2011r5_setup(void)
 {
-	rb2011_setup(RB2011_FLAG_SFP | RB2011_FLAG_USB | RB2011_FLAG_WLAN);
+	//RB2011_FLAG_WLAN
+	rb2011_setup(RB2011_FLAG_NEW_SFP | RB2011_FLAG_USB);
 }
 
 MIPS_MACHINE_NONAME(ATH79_MACH_RB_2011R5, "2011r5", rb2011r5_setup);
 
 static void __init rb2011g_setup(void)
 {
-	rb2011_setup(RB2011_FLAG_SFP |
+	rb2011_setup(RB2011_FLAG_OLD_SFP |
 		     RB2011_FLAG_USB |
 		     RB2011_FLAG_WLAN);
 }

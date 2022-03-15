@@ -11,7 +11,6 @@
  *  by the Free Software Foundation.
  */
 
-#include <linux/of_mdio.h>
 #include "ag71xx.h"
 
 static void ag71xx_phy_link_adjust(struct net_device *dev)
@@ -43,50 +42,246 @@ static void ag71xx_phy_link_adjust(struct net_device *dev)
 	spin_unlock_irqrestore(&ag->lock, flags);
 }
 
-int ag71xx_phy_connect(struct ag71xx *ag)
+void ag71xx_phy_set_phy_state(struct ag71xx *ag, int state)
 {
-	struct device_node *np = ag->pdev->dev.of_node;
-	struct device_node *phy_node;
-	int ret;
+	u32 bmcr = 0;
+	if(state){
+		bmcr &= ~BMCR_PDOWN; //включаем питание на трансивер
+		//на всякий случай еще рестартанем трансивер и автонеготинацию
+		bmcr |= BMCR_RESET | BMCR_ANENABLE;
+	}else{
+		//отрубаем трансивер
+		bmcr |= BMCR_PDOWN;
+	}
+	//printk(KERN_DEBUG "%s for dev := '%s', phy_dev = 0x%p\n", __func__, ag->dev->name, ag->phy_dev);
+	if(ag->phy_dev){
+		phy_write(ag->phy_dev, MII_BMCR, bmcr);
+	}
+}
 
-	if (of_phy_is_fixed_link(np)) {
-		ret = of_phy_register_fixed_link(np);
-		if (ret < 0) {
-			dev_err(&ag->pdev->dev,
-				"Failed to register fixed PHY link: %d\n", ret);
-			return ret;
-		}
+void ag71xx_phy_start(struct ag71xx *ag)
+{
+	struct ag71xx_platform_data *pdata = ag71xx_get_pdata(ag);
 
-		phy_node = of_node_get(np);
+	//printk(KERN_DEBUG "%s for dev := '%s'\n", __func__, ag->dev->name);
+	if (ag->phy_dev) {
+		ag71xx_phy_set_phy_state(ag, 1);
+		phy_start(ag->phy_dev);
+	} else if (pdata->mii_bus_dev && pdata->switch_data) {
+		ag71xx_ar7240_start(ag);
 	} else {
-		phy_node = of_parse_phandle(np, "phy-handle", 0);
+		ag->link = 1;
+		ag71xx_link_adjust(ag);
+	}
+}
+
+void ag71xx_phy_stop(struct ag71xx *ag)
+{
+	struct ag71xx_platform_data *pdata = ag71xx_get_pdata(ag);
+	unsigned long flags;
+
+	//printk(KERN_DEBUG "%s for dev := '%s'\n", __func__, ag->dev->name);
+
+	if (ag->phy_dev){
+		phy_stop(ag->phy_dev);
+		ag71xx_phy_set_phy_state(ag, 0);
+	}
+	else if (pdata->mii_bus_dev && pdata->switch_data)
+		ag71xx_ar7240_stop(ag);
+
+	spin_lock_irqsave(&ag->lock, flags);
+	if (ag->link) {
+		ag->link = 0;
+		ag71xx_link_adjust(ag);
+	}
+	spin_unlock_irqrestore(&ag->lock, flags);
+}
+
+static int ag71xx_phy_connect_fixed(struct ag71xx *ag)
+{
+	struct device *dev = &ag->pdev->dev;
+	struct ag71xx_platform_data *pdata = ag71xx_get_pdata(ag);
+	int ret = 0;
+
+	/* use fixed settings */
+	switch (pdata->speed) {
+	case SPEED_10:
+	case SPEED_100:
+	case SPEED_1000:
+		break;
+	default:
+		dev_err(dev, "invalid speed specified\n");
+		ret = -EINVAL;
+		break;
 	}
 
-	if (!phy_node) {
-		dev_err(&ag->pdev->dev,
-			"Could not find valid phy node\n");
+	dev_dbg(dev, "using fixed link parameters\n");
+
+	ag->duplex = pdata->duplex;
+	ag->speed = pdata->speed;
+
+	return ret;
+}
+
+static int ag71xx_phy_connect_multi(struct ag71xx *ag)
+{
+	struct device *dev = &ag->pdev->dev;
+	struct ag71xx_platform_data *pdata = ag71xx_get_pdata(ag);
+	struct phy_device *phydev = NULL;
+	int phy_addr;
+	int ret = 0;
+
+	for (phy_addr = 0; phy_addr < PHY_MAX_ADDR; phy_addr++) {
+		if (!(pdata->phy_mask & (1 << phy_addr)))
+			continue;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,5,0)
+		if (ag->mii_bus->phy_map[phy_addr] == NULL)
+			continue;
+
+		DBG("%s: PHY found at %s, uid=%08x\n",
+			dev_name(dev),
+			dev_name(&ag->mii_bus->phy_map[phy_addr]->dev),
+			ag->mii_bus->phy_map[phy_addr]->phy_id);
+
+		if (phydev == NULL)
+			phydev = ag->mii_bus->phy_map[phy_addr];
+#else
+		if (ag->mii_bus->mdio_map[phy_addr] == NULL)
+			continue;
+
+		DBG("%s: PHY found at %s, uid=%08x\n",
+			dev_name(dev),
+			dev_name(&ag->mii_bus->mdio_map[phy_addr]->dev),
+			ag->mii_bus->mdio_map[phy_addr]->phy_id);
+
+		if (phydev == NULL)
+			phydev = mdiobus_get_phy(ag->mii_bus, phy_addr);
+#endif
+	}
+
+	if (!phydev) {
+		dev_err(dev, "no PHY found with phy_mask=%08x\n",
+			   pdata->phy_mask);
 		return -ENODEV;
 	}
 
-	ag->phy_dev = of_phy_connect(ag->dev, phy_node, ag71xx_phy_link_adjust,
-				     0, ag->phy_if_mode);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,5,0)
+	ag->phy_dev = phy_connect(ag->dev, dev_name(&phydev->dev),
+#else
+	ag->phy_dev = phy_connect(ag->dev, phydev_name(phydev),
+#endif
+				  &ag71xx_phy_link_adjust,
+				  pdata->phy_if_mode);
 
-	of_node_put(phy_node);
-
-	if (!ag->phy_dev) {
-		dev_err(&ag->pdev->dev,
-			"Could not connect to PHY device. Deferring probe.\n");
-		return -EPROBE_DEFER;
+	if (IS_ERR(ag->phy_dev)) {
+		dev_err(dev, "could not connect to PHY at %s\n",
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,5,0)
+			   dev_name(&phydev->dev));
+#else
+			   phydev_name(phydev));
+#endif
+		return PTR_ERR(ag->phy_dev);
 	}
 
-	dev_info(&ag->pdev->dev, "connected to PHY at %s [uid=%08x, driver=%s]\n",
-		    phydev_name(ag->phy_dev),
-		    ag->phy_dev->phy_id, ag->phy_dev->drv->name);
+	/* mask with MAC supported features */
+	if (pdata->has_gbit)
+		phydev->supported &= PHY_GBIT_FEATURES;
+	else
+		phydev->supported &= PHY_BASIC_FEATURES;
+
+	phydev->advertising = phydev->supported;
+
+	dev_info(dev, "connected to PHY at %s [uid=%08x, driver=%s, phy_priv=%p]\n",
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,5,0)
+		    dev_name(&phydev->dev),
+#else
+		    phydev_name(phydev),
+#endif
+		    phydev->phy_id, phydev->drv->name, phydev->priv);
+
+	ag->link = 0;
+	ag->speed = 0;
+	ag->duplex = -1;
+
+  ag71xx_phy_set_phy_state(ag, 0); //initial state для WAN порта!
+
+	return ret;
+}
+
+static int dev_is_class(struct device *dev, void *class)
+{
+	if (dev->class != NULL && !strcmp(dev->class->name, class))
+		return 1;
 
 	return 0;
 }
 
+static struct device *dev_find_class(struct device *parent, char *class)
+{
+	if (dev_is_class(parent, class)) {
+		get_device(parent);
+		return parent;
+	}
+
+	return device_find_child(parent, class, dev_is_class);
+}
+
+static struct mii_bus *dev_to_mii_bus(struct device *dev)
+{
+	struct device *d;
+
+	d = dev_find_class(dev, "mdio_bus");
+	if (d != NULL) {
+		struct mii_bus *bus;
+
+		bus = to_mii_bus(d);
+		put_device(d);
+
+		return bus;
+	}
+
+	return NULL;
+}
+
+int ag71xx_phy_connect(struct ag71xx *ag)
+{
+	struct ag71xx_platform_data *pdata = ag71xx_get_pdata(ag);
+
+	if (pdata->mii_bus_dev == NULL ||
+	    pdata->mii_bus_dev->bus == NULL )
+		return ag71xx_phy_connect_fixed(ag);
+
+	ag->mii_bus = dev_to_mii_bus(pdata->mii_bus_dev);
+	//printk(KERN_DEBUG "%s: ag->mii_bus = 0x%p\n", ag->mii_bus);
+	if (ag->mii_bus == NULL) {
+		dev_err(&ag->pdev->dev, "unable to find MII bus on device '%s'\n",
+			   dev_name(pdata->mii_bus_dev));
+		return -ENODEV;
+	}
+
+	/* Reset the mdio bus explicitly */
+	if (ag->mii_bus->reset) {
+		mutex_lock(&ag->mii_bus->mdio_lock);
+		ag->mii_bus->reset(ag->mii_bus);
+		mutex_unlock(&ag->mii_bus->mdio_lock);
+	}
+
+	if (pdata->switch_data)
+		return ag71xx_ar7240_init(ag); //initial state для LAN портов свитча
+
+	if (pdata->phy_mask)
+		return ag71xx_phy_connect_multi(ag); //а вот эта ф-я на последок сделает initial state для WAN порта!
+
+	return ag71xx_phy_connect_fixed(ag);
+}
+
 void ag71xx_phy_disconnect(struct ag71xx *ag)
 {
-	phy_disconnect(ag->phy_dev);
+	struct ag71xx_platform_data *pdata = ag71xx_get_pdata(ag);
+
+	if (pdata->switch_data)
+		ag71xx_ar7240_cleanup(ag);
+	else if (ag->phy_dev)
+		phy_disconnect(ag->phy_dev);
 }

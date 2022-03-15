@@ -127,6 +127,7 @@ struct ar8327_platform_data {
 
 	unsigned num_leds;
 	const struct ar8327_led_info *leds;
+	u32 port6_custom_set_power_state;
 };
 
 #endif /* AR8216_PLATFORM_H */
